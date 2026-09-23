@@ -1,32 +1,37 @@
-from fastapi import APIRouter, HTTPException, status, Depends
+from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
-from typing import List
-import pymysql
-import pymysql.cursors
+from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 router = APIRouter()
 
-# Database Configuration
+# Database connection
+DATABASE_URL = "mysql+pymysql://root:YOUR_PASSWORD@localhost/recipe"
 
-db_config = {
-    "host": "localhost",
-    "user": "root",
-    "password": "",
-    "database": "recipe",
-    "cursorclass": pymysql.cursors.DictCursor,
-    "autocommit": False
-}
+engine = create_engine(DATABASE_URL)
+
+SessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    bind=engine
+)
+
+Base = declarative_base()
 
 
-def get_db():
-    connection = pymysql.connect(**db_config)
-    try:
-        yield connection
-    finally:
-        connection.close()
+# Recipe table
+class Recipe(Base):
+    __tablename__ = "Recipe"
 
-# Recipe Schemas
+    recipe_id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer)
+    name = Column(String(255))
+    instructions = Column(String(1000))
+    servings = Column(Integer)
+    prep_time = Column(Integer)
 
+
+# Request model
 class RecipeCreate(BaseModel):
     user_id: int
     name: str
@@ -35,6 +40,7 @@ class RecipeCreate(BaseModel):
     prep_time: int
 
 
+# Response model
 class RecipeResponse(BaseModel):
     recipe_id: int
     user_id: int
@@ -43,55 +49,32 @@ class RecipeResponse(BaseModel):
     servings: int
     prep_time: int
 
-# Get All Recipes
+    class Config:
+        from_attributes = True
 
-@router.get(
-    "/recipes",
-    response_model=List[RecipeResponse]
-)
-def get_all_recipes(db=Depends(get_db)):
 
-    with db.cursor() as cursor:
+# GET all recipes
+@router.get("/recipes", response_model=list[RecipeResponse])
+def get_all_recipes():
 
-        cursor.execute("""
-            SELECT
-                recipe_id,
-                user_id,
-                name,
-                instructions,
-                servings,
-                prep_time
-            FROM Recipe
-        """)
+    db = SessionLocal()
 
-        return cursor.fetchall()
+    try:
+        return db.query(Recipe).all()
+    finally:
+        db.close()
 
-#Get One Recipe
 
-@router.get(
-    "/recipes/{recipe_id}",
-    response_model=RecipeResponse
-)
-def get_recipe(
-    recipe_id: int,
-    db=Depends(get_db)
-):
+# GET one recipe
+@router.get("/recipes/{recipe_id}", response_model=RecipeResponse)
+def get_recipe(recipe_id: int):
 
-    with db.cursor() as cursor:
+    db = SessionLocal()
 
-        cursor.execute("""
-            SELECT
-                recipe_id,
-                user_id,
-                name,
-                instructions,
-                servings,
-                prep_time
-            FROM Recipe
-            WHERE recipe_id = %s
-        """, (recipe_id,))
-
-        recipe = cursor.fetchone()
+    try:
+        recipe = db.query(Recipe).filter(
+            Recipe.recipe_id == recipe_id
+        ).first()
 
         if not recipe:
             raise HTTPException(
@@ -101,200 +84,127 @@ def get_recipe(
 
         return recipe
 
-# POST - Create Recipe
+    finally:
+        db.close()
 
+
+# POST - create recipe
 @router.post(
     "/recipes",
     response_model=RecipeResponse,
     status_code=status.HTTP_201_CREATED
 )
-def create_recipe(
-    recipe: RecipeCreate,
-    db=Depends(get_db)
-):
+def create_recipe(recipe: RecipeCreate):
+
+    db = SessionLocal()
 
     try:
+        new_recipe = Recipe(
+            user_id=recipe.user_id,
+            name=recipe.name,
+            instructions=recipe.instructions,
+            servings=recipe.servings,
+            prep_time=recipe.prep_time
+        )
 
-        with db.cursor() as cursor:
+        db.add(new_recipe)
+        db.commit()
+        db.refresh(new_recipe)
 
-            cursor.execute("""
-                INSERT INTO Recipe
-                (
-                    user_id,
-                    name,
-                    instructions,
-                    servings,
-                    prep_time
-                )
-                VALUES (%s, %s, %s, %s, %s)
-            """, (
-                recipe.user_id,
-                recipe.name,
-                recipe.instructions,
-                recipe.servings,
-                recipe.prep_time
-            ))
-
-            recipe_id = cursor.lastrowid
-
-            db.commit()
-
-            cursor.execute("""
-                SELECT
-                    recipe_id,
-                    user_id,
-                    name,
-                    instructions,
-                    servings,
-                    prep_time
-                FROM Recipe
-                WHERE recipe_id = %s
-            """, (recipe_id,))
-
-            return cursor.fetchone()
+        return new_recipe
 
     except Exception as e:
-
         db.rollback()
-
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status_code=500,
             detail=f"Database error: {str(e)}"
         )
 
+    finally:
+        db.close()
 
 
-# PUT - Update Recipe
-
-
+# PUT - update recipe
 @router.put(
     "/recipes/{recipe_id}",
     response_model=RecipeResponse
 )
 def update_recipe(
     recipe_id: int,
-    recipe: RecipeCreate,
-    db=Depends(get_db)
+    recipe: RecipeCreate
 ):
 
+    db = SessionLocal()
+
     try:
+        existing_recipe = db.query(Recipe).filter(
+            Recipe.recipe_id == recipe_id
+        ).first()
 
-        with db.cursor() as cursor:
+        if not existing_recipe:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Recipe not found"
+            )
 
-            # Check if recipe exists
-            cursor.execute("""
-                SELECT recipe_id
-                FROM Recipe
-                WHERE recipe_id = %s
-            """, (recipe_id,))
+        existing_recipe.user_id = recipe.user_id
+        existing_recipe.name = recipe.name
+        existing_recipe.instructions = recipe.instructions
+        existing_recipe.servings = recipe.servings
+        existing_recipe.prep_time = recipe.prep_time
 
-            existing_recipe = cursor.fetchone()
+        db.commit()
+        db.refresh(existing_recipe)
 
-            if not existing_recipe:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="Recipe not found"
-                )
-
-            # Update recipe
-            cursor.execute("""
-                UPDATE Recipe
-                SET
-                    user_id = %s,
-                    name = %s,
-                    instructions = %s,
-                    servings = %s,
-                    prep_time = %s
-                WHERE recipe_id = %s
-            """, (
-                recipe.user_id,
-                recipe.name,
-                recipe.instructions,
-                recipe.servings,
-                recipe.prep_time,
-                recipe_id
-            ))
-
-            db.commit()
-
-            # Return updated recipe
-            cursor.execute("""
-                SELECT
-                    recipe_id,
-                    user_id,
-                    name,
-                    instructions,
-                    servings,
-                    prep_time
-                FROM Recipe
-                WHERE recipe_id = %s
-            """, (recipe_id,))
-
-            return cursor.fetchone()
+        return existing_recipe
 
     except HTTPException:
         raise
 
     except Exception as e:
-
         db.rollback()
-
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status_code=500,
             detail=f"Database error: {str(e)}"
         )
 
+    finally:
+        db.close()
 
-# Delete Recipe
 
+# DELETE - delete recipe
+@router.delete("/recipes/{recipe_id}")
+def delete_recipe(recipe_id: int):
 
-@router.delete(
-    "/recipes/{recipe_id}"
-)
-def delete_recipe(
-    recipe_id: int,
-    db=Depends(get_db)
-):
+    db = SessionLocal()
 
     try:
+        recipe = db.query(Recipe).filter(
+            Recipe.recipe_id == recipe_id
+        ).first()
 
-        with db.cursor() as cursor:
+        if not recipe:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Recipe not found"
+            )
 
-            # Check if recipe exists
-            cursor.execute("""
-                SELECT recipe_id
-                FROM Recipe
-                WHERE recipe_id = %s
-            """, (recipe_id,))
+        db.delete(recipe)
+        db.commit()
 
-            existing_recipe = cursor.fetchone()
-
-            if not existing_recipe:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="Recipe not found"
-                )
-
-            # Delete recipe
-            cursor.execute("""
-                DELETE FROM Recipe
-                WHERE recipe_id = %s
-            """, (recipe_id,))
-
-            db.commit()
-
-            return {
-                "message": "Recipe deleted successfully"
-            }
+        return {
+            "message": "Recipe deleted successfully"
+        }
 
     except HTTPException:
         raise
 
     except Exception as e:
-
         db.rollback()
-
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status_code=500,
             detail=f"Database error: {str(e)}"
         )
+
+    finally:
+        db.close()
